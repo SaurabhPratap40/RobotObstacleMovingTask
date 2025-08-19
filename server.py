@@ -1,3 +1,4 @@
+# server.py
 import asyncio
 import json
 import websockets
@@ -19,7 +20,11 @@ def add_cors_headers(resp):
 # ---------------------------
 connected = set()
 async_loop = None
-collision_count = 0  # <-- new: server-tracked collisions
+collision_count = 0
+
+# For autopilot / monitor
+latest_capture = None   # dict: { "timestamp": ..., "image": "<base64|data:...>", "position": {...} }
+latest_event = None     # last event dict
 
 FLOOR_HALF = 50  # index.html uses PlaneGeometry(100, 100) centered at origin
 
@@ -37,40 +42,61 @@ def corner_to_coords(corner: str, margin=5):
 # WebSocket Handler
 # ---------------------------
 async def ws_handler(websocket, path=None):
-    global collision_count
+    global collision_count, latest_capture, latest_event
     print("Client connected via WebSocket")
     connected.add(websocket)
     try:
         async for message in websocket:
-            # Record any simulator messages and increment collision_count on "collision"
+            # try to parse JSON
             try:
                 data = json.loads(message)
-                if isinstance(data, dict) and data.get("type") == "collision" and data.get("collision"):
-                    collision_count += 1
             except Exception:
-                pass
+                data = None
+
+            # record capture responses
+            if isinstance(data, dict) and data.get("type") == "capture_image_response":
+                # store entire payload
+                latest_capture = {
+                    "timestamp": data.get("timestamp"),
+                    "image": data.get("image"),
+                    "position": data.get("position"),
+                }
+                latest_event = {"type": "capture_ack", "timestamp": data.get("timestamp")}
+            # record collisions
+            if isinstance(data, dict) and data.get("type") == "collision" and data.get("collision"):
+                collision_count += 1
+                latest_event = data
+            # record goal reached and confirmations
+            if isinstance(data, dict) and data.get("type") in {"goal_reached", "confirmation"}:
+                latest_event = data
+
+            # print (for debugging)
             print("Received from simulator:", message)
     except websockets.exceptions.ConnectionClosed:
         print("Client disconnected")
     finally:
-        connected.remove(websocket)
+        connected.discard(websocket)
 
 def broadcast(msg: dict):
+    """Broadcast a JSON message to all connected websocket clients (non-blocking)."""
     if not connected:
         return False
     for ws in list(connected):
-        asyncio.run_coroutine_threadsafe(ws.send(json.dumps(msg)), async_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send(json.dumps(msg)), async_loop)
+        except Exception as e:
+            print("broadcast error:", e)
     return True
 
 # ---------------------------
-# Existing Endpoints
+# Flask Endpoints (HTTP API)
 # ---------------------------
 @app.route('/move', methods=['POST'])
 def move():
     data = request.get_json()
     if not data or 'x' not in data or 'z' not in data:
         return jsonify({'error': 'Missing parameters. Please provide "x" and "z".'}), 400
-    x, z = data['x'], data['z']
+    x, z = float(data['x']), float(data['z'])
     msg = {"command": "move", "target": {"x": x, "y": 0, "z": z}}
     if not broadcast(msg):
         return jsonify({'error': 'No connected simulators.'}), 400
@@ -81,7 +107,7 @@ def move_rel():
     data = request.get_json()
     if not data or 'turn' not in data or 'distance' not in data:
         return jsonify({'error': 'Missing parameters. Please provide "turn" and "distance".'}), 400
-    msg = {"command": "move_relative", "turn": data['turn'], "distance": data['distance']}
+    msg = {"command": "move_relative", "turn": float(data['turn']), "distance": float(data['distance'])}
     if not broadcast(msg):
         return jsonify({'error': 'No connected simulators.'}), 400
     return jsonify({'status': 'move relative command sent', 'command': msg})
@@ -100,9 +126,6 @@ def capture():
         return jsonify({'error': 'No connected simulators.'}), 400
     return jsonify({'status': 'capture command sent', 'command': msg})
 
-# ---------------------------
-# Goal + Obstacles (from your previous step)
-# ---------------------------
 @app.route('/goal', methods=['POST'])
 def set_goal():
     data = request.get_json() or {}
@@ -155,22 +178,42 @@ def set_obstacle_motion():
     return jsonify({'status': 'obstacle motion updated', 'config': msg})
 
 # ---------------------------
-# NEW: Collisions & Reset
+# Collisions / Reset / Latest capture/event endpoints
 # ---------------------------
 @app.route('/collisions', methods=['GET'])
 def get_collisions():
-    """Return the total number of collisions seen (from simulator messages)."""
     return jsonify({'count': collision_count})
 
 @app.route('/reset', methods=['POST'])
 def reset():
-    """Reset collision count and broadcast a reset command to the simulator."""
     global collision_count
     collision_count = 0
     if not broadcast({"command": "reset"}):
-        # Even if no simulator is connected, we consider the counter reset.
         return jsonify({'status': 'reset done (no simulators connected)', 'collisions': collision_count})
     return jsonify({'status': 'reset broadcast', 'collisions': collision_count})
+
+@app.route('/latest_capture', methods=['GET'])
+def get_latest_capture():
+    """Returns the latest capture. ?meta=1 returns metadata without the full image."""
+    global latest_capture
+    if latest_capture is None:
+        return jsonify({'available': False}), 200
+    if request.args.get('meta') == '1':
+        meta = {k: v for k, v in latest_capture.items() if k != 'image'}
+        meta['available'] = True
+        return jsonify(meta), 200
+    resp = dict(latest_capture)
+    resp['available'] = True
+    return jsonify(resp), 200
+
+@app.route('/latest_event', methods=['GET'])
+def get_latest_event():
+    global latest_event
+    if latest_event is None:
+        return jsonify({'available': False}), 200
+    resp = dict(latest_event)
+    resp['available'] = True
+    return jsonify(resp), 200
 
 # ---------------------------
 # Flask Thread
@@ -179,7 +222,7 @@ def start_flask():
     app.run(port=5000)
 
 # ---------------------------
-# Main Async for WebSocket
+# Main Async for WebSocket (port 8080)
 # ---------------------------
 async def main():
     global async_loop

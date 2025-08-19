@@ -1,0 +1,5 @@
+flask
+websockets
+requests
+numpy
+opencv-python

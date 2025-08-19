@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sim-1 Monitor</title>
+  <style>
+    body { background: #0b0d10; color: #e7eaee; font-family: sans-serif; margin: 20px; }
+    #frame { width: 640px; border: 1px solid #333; background: #000; }
+    #log { margin-top:10px; white-space:pre-wrap; font-family: monospace; background:#0d1114; padding:8px; border-radius:6px; max-height:300px; overflow:auto;}
+  </style>
+</head>
+<body>
+  <h2>Sim-1 Monitor</h2>
+  <button onclick="doCapture()">Capture</button>
+  <button onclick="doReset()">Reset</button>
+  <button onclick="doGoal('NE')">Goal NE</button>
+  <button onclick="doGoal('NW')">Goal NW</button>
+  <div>
+    <img id="frame" alt="latest capture" />
+  </div>
+  <div id="log"></div>
+
+<script>
+const API = "http://localhost:5000";
+async function jget(p){ return (await fetch(API+p)).json(); }
+async function jpost(p,b){ return (await fetch(API+p,{method:'POST',headers: {'Content-Type':'application/json'}, body:b?JSON.stringify(b):'{}'})).json(); }
+async function refresh(){
+  try{
+    const cap = await jget('/latest_capture');
+    if(cap && cap.available && cap.image){
+      document.getElementById('frame').src = cap.image.startsWith('data:')? cap.image : 'data:image/png;base64,'+cap.image;
+    }
+    const ev = await jget('/latest_event');
+    const cols = await jget('/collisions');
+    log(JSON.stringify({event:ev, collisions:cols}));
+  }catch(e){ log('refresh err: '+e) }
+}
+function log(m){ const e=document.getElementById('log'); e.textContent = new Date().toLocaleTimeString() + '  ' + m + '\n' + e.textContent; }
+async function doCapture(){ await jpost('/capture'); setTimeout(refresh,200); }
+async function doReset(){ await jpost('/reset'); setTimeout(refresh,200); }
+async function doGoal(c){ await jpost('/goal', {corner:c}); setTimeout(refresh,200); }
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>
